@@ -30,6 +30,12 @@ Distributed under the Boost Software License, Version 1.0.
 #include <thread>
 #include <vector>
 
+#ifndef _WIN32
+// For `mode_t` and the process umask, used by the permission preservation test.
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 #ifdef __linux__
 // For the private mount namespace in which the fallback setup failure test runs.
 #include <csignal>
@@ -119,6 +125,109 @@ static void TestOverwriteExisting(const llfio::directory_handle &dirh)
   }
   BOOST_CHECK(read_file(dirh, "existing.txt") == "abc");
 }
+
+#ifndef _WIN32
+// The full path of a leaf within the test directory.
+static std::string path_of(const llfio::directory_handle &dirh, llfio::path_view p)
+{
+  return (dirh.current_path().value() / p.path()).string();
+}
+
+// Reads a path's permission bits with a plain POSIX stat, deliberately independently of the
+// mechanism `atomic_file` uses, so that this checks the observable outcome rather than repeating the
+// implementation's own logic. Note this needs no permission on the file itself, only on its parent.
+static uint16_t perms_of(const llfio::directory_handle &dirh, llfio::path_view p)
+{
+  const std::string full = path_of(dirh, p);
+  struct stat s
+  {
+  };
+  BOOST_REQUIRE(::stat(full.c_str(), &s) == 0);
+  return static_cast<uint16_t>(s.st_mode & 0xfff);
+}
+
+// Creates a file if needed, then sets its permission bits with a plain POSIX chmod.
+static bool set_perms(const llfio::directory_handle &dirh, llfio::path_view p, uint16_t mode)
+{
+  auto fh = llfio::file_handle::file(dirh, p, llfio::file_handle::mode::write, llfio::file_handle::creation::if_needed);
+  if(!fh)
+  {
+    return false;
+  }
+  BOOST_REQUIRE(fh.value().close());
+  return ::chmod(path_of(dirh, p).c_str(), static_cast<mode_t>(mode)) == 0;
+}
+
+// Replacing an existing file must leave its permission bits alone, as QSaveFile does. Without that
+// an atomic save silently changes the mode of the destination: it drops the executable bit off a
+// script, and it widens a file the caller had tightened.
+static void TestPreservePermissions(const llfio::directory_handle &dirh)
+{
+  /* Read the process umask using the standard round trip. A temporary file is created with mode
+  0660 *before* the umask is applied, so that is the mode a replaced destination would be left with
+  were its own permissions not preserved. Every mode tested below is unequal to it for any umask, so
+  a failure here means a failure to preserve, and not something else.
+  */
+  const mode_t um = ::umask(0);
+  ::umask(um);
+  const uint16_t unpreserved = static_cast<uint16_t>(0660 & ~um);
+  // 0644 and 0755 set "other" bits, and 0700 sets an owner execute bit, none of which the creation
+  // mode 0660 can ever set. 0600 and 0640 are the realistic tightened modes.
+  const uint16_t modes[] = {0600, 0640, 0644, 0700, 0755};
+  // Precondition: this filing system must be able to report a mode at all. Note this is a skip, not
+  // a failure: a filing system with no permissions cannot have lost any.
+  if(!set_perms(dirh, "perms_probe.txt", 0644) || perms_of(dirh, "perms_probe.txt") != 0644)
+  {
+    BOOST_TEST_MESSAGE("this filing system does not support permissions, skipping");
+    return;
+  }
+  size_t index = 0;
+  for(const uint16_t mode : modes)
+  {
+    const std::string name = "perms" + std::to_string(index++) + ".txt";
+    if(mode == unpreserved)
+    {
+      continue;  // this one would be preserved by accident, so it could not detect a failure
+    }
+    BOOST_REQUIRE(set_perms(dirh, name, mode));
+    {
+      atomic_file f = atomic_file::open(dirh, name).value();
+      BOOST_CHECK(f.write(buf("contents")).value() == 8);
+      BOOST_CHECK(f.commit());
+    }
+    BOOST_CHECK(read_file(dirh, name) == "contents");
+    const uint16_t got = perms_of(dirh, name);
+    if(got != mode)
+    {
+      /* NOTE: in this test framework BOOST_CHECK_MESSAGE only prints, it does not register a
+      failure. So print the diagnosis here, and register the failure with a plain BOOST_CHECK. */
+      BOOST_TEST_MESSAGE("destination mode " << std::oct << mode << " became " << std::oct << got);
+    }
+    BOOST_CHECK(got == mode);
+  }
+  {
+    // A destination which the caller cannot even read must still keep its mode: it is read through
+    // an anchor handle, which needs no permission on the destination itself. Its contents cannot be
+    // read back here for that same reason, so this part checks the mode alone.
+    BOOST_REQUIRE(set_perms(dirh, "perms0000.txt", 0000));
+    BOOST_CHECK_EQUAL(perms_of(dirh, "perms0000.txt"), 0000);
+    atomic_file f = atomic_file::open(dirh, "perms0000.txt").value();
+    BOOST_CHECK(f.write(buf("contents")).value() == 8);
+    BOOST_CHECK(f.commit());
+    BOOST_CHECK_EQUAL(perms_of(dirh, "perms0000.txt"), 0000);
+  }
+  {
+    // A destination which does not exist has no mode to preserve, so the new file keeps the mode the
+    // temporary file was created with. This feature deliberately does not invent permissions for a
+    // file which was not there before.
+    atomic_file f = atomic_file::open(dirh, "perms_new.txt").value();
+    BOOST_CHECK(f.write(buf("fresh")).value() == 5);
+    BOOST_CHECK(f.commit());
+    BOOST_CHECK(read_file(dirh, "perms_new.txt") == "fresh");
+    BOOST_CHECK_EQUAL(perms_of(dirh, "perms_new.txt"), unpreserved);
+  }
+}
+#endif
 
 // Multiple sequential writes must concatenate, and must go through the tracked offset.
 static void TestMultipleWrites(const llfio::directory_handle &dirh)
@@ -624,6 +733,9 @@ static inline void TestAtomicFile()
 
     TestCreateNewFile(dirh);
     TestOverwriteExisting(dirh);
+#ifndef _WIN32
+    TestPreservePermissions(dirh);
+#endif
     TestMultipleWrites(dirh);
     TestEmptyWrite(dirh);
     TestDiscardOnDestruction(dirh);

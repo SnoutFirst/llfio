@@ -72,12 +72,18 @@ contents (subject to the storage stack actually honouring flushes, see caveats b
 flush the directory entry we open the containing directory with `directory_handle::directory()`,
 which requires read permission on that directory. Directories which may be written but not read
 (a rare configuration) will cause `open()` to fail.
-- **Permissions and ownership of an existing destination are not preserved.** The temporary file is
-created with the process umask, and after the rename it becomes the destination. If you need to
-preserve the mode, ownership, ACLs or extended attributes of an existing destination, do so
-yourself after `commit()` (or before it, on the temporary file, which is not exposed here). This is
-a deliberate simplification; it is also the one place where behaviour differs between operating
-systems in ways we do not attempt to paper over.
+- **Permissions of an existing destination are preserved.** If the destination is a regular file when
+`commit()` is reached, its permission bits are read and applied to the temporary file before the
+replacement, so the new contents keep the mode of the file they replace. Without this an atomic save
+would silently change the mode of the destination - dropping the executable bit off a script, or
+widening a 0600 file to the umask default - which is both surprising and a security problem. This is
+what `QSaveFile` does. The mode is read without opening the destination, so it does not matter
+whether the caller can read the destination's contents. If the destination does not exist, is not a
+regular file (a symbolic link, say, whose mode is 0777 and describes the link rather than the file
+which replaces it), or lives on a filing system which does not report or apply permissions, the
+temporary file keeps the mode it was created with, subject to the process umask. This step is best
+effort and never fails the commit. Ownership, ACLs and extended attributes are **not** copied, only
+the permission bits; if you need those preserved, do so yourself.
 - **The fallback mode is not atomic.** See `options::fallback` below. When it is active, guarantee
 (1) and guarantee (2) do not hold.
 - **Storage stacks which lie about flushes** (some cheap USB sticks, some virtualised block layers)
@@ -89,17 +95,19 @@ replaced.
 
 \section atomic_file_commit_failure When commit() fails partway through
 
-`commit()` performs, in order: (i) a single `barrier_kind::wait_all` barrier of the temporary file,
-(ii) an atomic replacement of the destination with the temporary file, and (iii) a flush of the
-containing directory's metadata.
+`commit()` performs, in order: (i) if the destination is a regular file, its permission bits are
+applied to the temporary file (see the permissions caveat above), (ii) a single `barrier_kind::wait_all`
+barrier of
+the temporary file, (iii) an atomic replacement of the destination with the temporary file, and (iv)
+a flush of the containing directory's metadata.
 
-If step (i) or (ii) fails, the destination has *not* been replaced, the temporary file is discarded,
-and `commit()` returns the failure.
+If step (ii) or (iii) fails, the destination has *not* been replaced, the temporary file is
+discarded, and `commit()` returns the failure. Step (i) cannot fail the commit; it is best effort.
 
-If step (iii) fails, the destination *has* already been replaced with the new content (this is
+If step (iv) fails, the destination *has* already been replaced with the new content (this is
 unavoidable: the rename is a single atomic operation and there is no way to undo it), but the
 durability of that replacement is not confirmed. In that case `commit()` returns the failure from
-step (iii), and `replacement_performed()` returns true so you can tell the two situations apart.
+step (iv), and `replacement_performed()` returns true so you can tell the two situations apart.
 */
 class LLFIO_DECL atomic_file
 {
@@ -261,7 +269,8 @@ public:
   /*! Publish the transaction's contents to the destination path, atomically and durably.
 
   On success, the destination path now names the new content, that content is on stable storage,
-  and the directory entry naming it has been flushed.
+  and the directory entry naming it has been flushed. If the destination existed, the new file has
+  its permission bits; see the permissions caveat in the class documentation.
 
   If a write previously failed, this discards the temporary file and returns that earlier failure.
   If the transaction was cancelled, this returns `errc::operation_canceled` and does not publish.
@@ -327,6 +336,13 @@ private:
   //! The handle the transaction is currently writing to. In fallback mode this is the caller's real
   //! destination, which this object does not own; never use it for anything destructive.
   file_handle &_write_target() noexcept { return _fallback ? _destination : _tempfile; }
+
+  /*! Applies the existing destination's permission bits to `_tempfile`, so that the replacement
+  keeps the mode of the file it replaces. Best effort: it is a no-op when the destination does not
+  exist, is not a regular file, or its permissions cannot be read or applied, and it never reports a
+  failure. See the permissions caveat in the class documentation.
+  */
+  LLFIO_HEADERS_ONLY_MEMFUNC_SPEC void _preserve_destination_permissions(deadline d) noexcept;
 };
 
 LLFIO_V2_NAMESPACE_END

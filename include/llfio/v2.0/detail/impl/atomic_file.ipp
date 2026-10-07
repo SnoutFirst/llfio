@@ -140,6 +140,59 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<atomic_file::size_type> atomic_file::writ
   return write(const_buffers_type(buf, 1), d);
 }
 
+/*! Applies the existing destination's permission bits to the temporary file, so that the replacement
+keeps the mode of the file it replaces.
+
+This is best effort and never fails the commit: a filing system which cannot report or apply
+permissions (and an absent destination) must not stop a caller saving their data.
+*/
+void atomic_file::_preserve_destination_permissions(deadline d) noexcept
+{
+  /* The rename in `commit()` discards the destination's inode, and with it the destination's
+  permission bits, leaving whichever ones the temporary file happened to be created with. Read the
+  old mode first and stamp it onto the file which is about to take its place. This is what
+  `QSaveFile` does, and it is what stops an atomic save from silently changing the mode of the file
+  being replaced - dropping the executable bit off a script, or widening a 0600 file to the umask
+  default.
+
+  The mode is read *without opening the destination*: asking `_dirh` to fill a single buffer entry
+  for a leafname which contains no glob is a single `fstatat()` of that entry relative to the
+  directory handle. So it needs no permission on the destination itself - a file the caller cannot
+  even read still has a mode worth preserving - and it cannot block, as opening the destination
+  would if the destination were a FIFO with no writer. Being relative to `_dirh` also means no
+  component of the destination path is re-resolved, so a third party cannot substitute a different
+  entry for the one whose mode we read. `stat_t::stamp()` then applies the mode through the
+  temporary file's handle. Neither half goes anywhere near a path, and neither can fail the commit.
+  */
+  directory_entry entry{};
+  directory_handle::buffers_type buffers(span<directory_entry>(&entry, 1));
+  auto filled = _dirh.read(directory_handle::io_request<directory_handle::buffers_type>(std::move(buffers), _leafname), d);
+  if(!filled)
+  {
+    // Most commonly `errc::no_such_file_or_directory`: there is no existing destination whose
+    // permissions could be preserved, so the temporary file keeps the mode it was created with.
+    return;
+  }
+  if((filled.value().metadata() & stat_t::want::perms) == 0)
+  {
+    // `read()` reports which metadata it filled in, and on Windows (where permission bits do not
+    // exist at all) `perms` is never among it. Stamping here would apply whatever happened to be in
+    // `st_perms`, so leave the temporary file's own mode alone instead.
+    return;
+  }
+  if(filled.value().empty() || entry.stat.st_type != filesystem::file_type::regular)
+  {
+    /* Only a regular file has a mode which it makes sense to carry across to its replacement. A
+    symbolic link's mode is 0777 and says nothing about the file which replaces it, a FIFO's or
+    device's is not the mode of the new file either, and a directory cannot be replaced at all.
+    */
+    return;
+  }
+  // Applying the mode can fail on a filing system which does not support permissions at all. The
+  // caller asked for their contents to be saved, not for this, so let the commit proceed without.
+  (void) entry.stat.stamp(_tempfile, stat_t::want::perms);
+}
+
 LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<void> atomic_file::commit(deadline d) noexcept
 {
   LLFIO_EXCEPTION_TRY
@@ -156,6 +209,13 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<void> atomic_file::commit(deadline d) noe
     {
       _state = state::failed;
       return std::move(_write_error);
+    }
+    if(!_fallback)
+    {
+      // Fallback mode writes the destination's own inode in place, so there is nothing to preserve
+      // there. Do this before the barrier below, so that the mode change it makes is covered by
+      // that barrier and is therefore durable by the time the rename is published.
+      _preserve_destination_permissions(d);
     }
     // Exactly one durability barrier, at commit time, for all the data written so far plus the
     // file metadata needed to retrieve it. Note that a synchronous barrier cannot honour a
