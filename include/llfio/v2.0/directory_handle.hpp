@@ -351,6 +351,20 @@ public:
     return name.empty() ? uniquely_named_directory(tempdirh, _mode, _caching, flags) : directory(tempdirh, name, _mode, _creation, _caching, flags);
   }
 
+  /*! \brief Flush any metadata changes to this directory's entry list to permanent storage.
+
+  This is the directory analogue of `byte_io_handle::barrier()`. It is what makes a preceding
+  `fs_handle::relink()` (i.e. an atomic rename of a file into this directory) durable: the rename
+  changes the directory's metadata, and unless that metadata reaches storage, a power loss may lose
+  the rename even though the renamed file's own data and metadata were already flushed.
+
+  On POSIX this is a `fsync()` of the directory. On Windows this is a flush of the directory handle.
+  This is a relatively expensive operation, so issue it once after a batch of changes, not per change.
+
+  \errors Any of the values POSIX fsync() or Windows NtFlushBuffersFileEx() can return.
+  */
+  LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<void> barrier() noexcept;
+
   LLFIO_HEADERS_ONLY_VIRTUAL_SPEC ~directory_handle() override
   {
     if(_v)

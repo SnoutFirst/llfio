@@ -596,4 +596,31 @@ result<directory_handle::buffers_type> directory_handle::read(io_request<buffers
   }
 }
 
+result<void> directory_handle::barrier() noexcept
+{
+  windows_nt_kernel::init();
+  using namespace windows_nt_kernel;
+  LLFIO_LOG_FUNCTION_CALL(this);
+  if(!_v)
+  {
+    return errc::invalid_argument;
+  }
+  IO_STATUS_BLOCK ol = make_iostatus();
+  NTSTATUS ntstat;
+  if(NtFlushBuffersFileEx != nullptr)
+  {
+    // flags == 0 flushes the data and the metadata needed to retrieve it.
+    ntstat = NtFlushBuffersFileEx(_v.h, 0, nullptr, 0, &ol);
+  }
+  else
+  {
+    ntstat = NtFlushBuffersFile(_v.h, &ol);
+  }
+  if(ntstat < 0)
+  {
+    return ntkernel_error(ntstat);
+  }
+  return success();
+}
+
 LLFIO_V2_NAMESPACE_END

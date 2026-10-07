@@ -537,4 +537,18 @@ result<directory_handle::buffers_type> directory_handle::read(io_request<buffers
   }
 }
 
+result<void> directory_handle::barrier() noexcept
+{
+  LLFIO_LOG_FUNCTION_CALL(this);
+  if(!_v)
+  {
+    return errc::invalid_argument;
+  }
+  if(::fsync(_v.fd) < 0)
+  {
+    return posix_error();
+  }
+  return success();
+}
+
 LLFIO_V2_NAMESPACE_END
