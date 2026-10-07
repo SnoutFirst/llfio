@@ -89,9 +89,9 @@ below. When it is active, guarantee (1) and guarantee (2) do not hold.
 - **Storage stacks which lie about flushes** (some cheap USB sticks, some virtualised block layers)
 will break guarantee (3) no matter what this class does.
 - On Windows, directory metadata durability relies upon the OS and filesystem accepting a flush of
-a directory handle. If the platform returns an error for that step, `commit()` reports it (see
-below), and `replacement_performed()` will tell you whether the destination had already been
-replaced.
+a directory handle (see `directory_handle::barrier()`). If the platform returns an error for that
+step, `commit()` reports it (see below), and `replacement_performed()` will tell you whether the
+destination had already been replaced.
 
 \section atomic_file_commit_failure When commit() fails partway through
 
@@ -99,7 +99,7 @@ replaced.
 applied to the temporary file (see the permissions caveat above), (ii) a single `barrier_kind::wait_all`
 barrier of
 the temporary file, (iii) an atomic replacement of the destination with the temporary file, and (iv)
-a flush of the containing directory's metadata.
+a `directory_handle::barrier()` of the containing directory, which flushes its metadata.
 
 If step (ii) or (iii) fails, the destination has *not* been replaced, the temporary file is
 discarded, and `commit()` returns the failure. Step (i) cannot fail the commit; it is best effort.
