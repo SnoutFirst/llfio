@@ -42,7 +42,15 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<atomic_file> atomic_file::open(const path
       return errc::invalid_argument;
     }
     atomic_file ret;
-    ret._fallback = opts.fallback;
+    /* `opts.fallback` says "falling back is *permitted*", not "this transaction *is* falling back".
+    `_fallback` records which of the two it actually turned out to be, so it must stay at its `false`
+    default until the temporary file really could not be created and the destination's own inode has
+    been opened directly. Copying the caller's preference here would make an ordinary, successful
+    transaction claim to be in fallback mode: `is_fallback()` would lie, `cancel()` would refuse as
+    unimplementable, the permission preservation would be skipped, and - worst of all -
+    `_write_target()` would aim at the unopened destination instead of the temporary file which is
+    the entire point of this class. See \ref atomic_file_fallback.
+    */
     // We own only the leafname, not the whole target path. The containing directory is held as an
     // open handle, which both anchors the destination against third party path changes and lets us
     // flush the directory entry at commit time.
@@ -78,10 +86,12 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<atomic_file> atomic_file::open(const path
     {
       return failed;
     }
-    // The caller has opted in to the non-atomic fallback: write the destination in place. Note that
-    // the real destination is stored in `_destination`, never in `_tempfile`, so if any of the steps
-    // below fail and this partially constructed object is destroyed, the destructor has no handle to
-    // the destination and cannot delete it.
+    // The caller has opted in to the non-atomic fallback *and* the temporary file could not be
+    // created for the one error class which means this is worth trying, so this is where the
+    // transaction actually enters fallback mode - the only place `_fallback` ever becomes true.
+    // Note that the real destination is stored in `_destination`, never in `_tempfile`, so if any of
+    // the steps below fail and this partially constructed object is destroyed, the destructor has no
+    // handle to the destination and cannot delete it.
     ret._fallback = true;
     auto direct = file_handle::file(ret._dirh, ret._leafname, mode::write, creation::if_needed, opts._caching);
     if(!direct)

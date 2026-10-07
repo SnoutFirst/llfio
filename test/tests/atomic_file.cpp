@@ -655,6 +655,88 @@ static void TestFallback(const llfio::directory_handle &dirh)
                                  ec);
 }
 
+// `options(true)` means "falling back is permitted", not "this transaction is in fallback mode".
+// When the temporary file *can* be created, an opted-in transaction must be an entirely ordinary
+// atomic one, and must report itself as such.
+//
+// This is a regression test: `open()` used to initialise `_fallback` from `opts.fallback` before it
+// had even tried to create the temporary file, so an opted-in transaction in an ordinary writable
+// directory believed it was in fallback mode. `is_fallback()` returned true, `cancel()` refused as
+// unimplementable, and `_write_target()` aimed at `_destination` - which at that point had never
+// been opened - so every write went to an invalid handle instead of the temporary file.
+static void TestFallbackPermittedButUnused(const llfio::directory_handle &dirh)
+{
+  const llfio::filesystem::path dirpath = dirh.current_path().value();
+  {
+    std::ofstream(dirpath / "fallback_allowed.txt") << "original";
+  }
+  BOOST_REQUIRE(llfio::filesystem::exists(dirpath / "fallback_allowed.txt"));
+  const size_t temps_before = count_random_files(dirpath);
+  {
+    atomic_file f = atomic_file::open(dirh, "fallback_allowed.txt", atomic_file::options(true)).value();
+    // The temporary file was created, so the fallback was not taken: this is a normal transaction
+    // which merely happened to be *allowed* to fall back.
+    BOOST_CHECK(!f.is_fallback());
+    BOOST_CHECK(!f.replacement_performed());
+    BOOST_CHECK(f.current_state() == atomic_file::state::open);
+    // An ordinary transaction owns a newly created temporary file, and has not touched the
+    // destination yet.
+    BOOST_CHECK_EQUAL(count_random_files(dirpath), temps_before + 1);
+    auto w = f.write(buf("replacement"));
+    BOOST_REQUIRE(!w.has_error());
+    BOOST_CHECK(w.value() == 11);
+    // The bytes went to the temporary file, not to the destination: the destination still holds its
+    // previous contents. Had `_fallback` been copied from the caller's option, the write would have
+    // bypassed the temporary file and the destination would already read "replacement" here.
+    BOOST_CHECK(read_file(dirh, "fallback_allowed.txt") == "original");
+    BOOST_CHECK(!f.replacement_performed());
+    BOOST_CHECK(f.commit());
+    BOOST_CHECK(f.current_state() == atomic_file::state::committed);
+    BOOST_CHECK(f.replacement_performed());
+    // And it is refused a second time, exactly as for any other transaction.
+    auto c2 = f.commit();
+    BOOST_REQUIRE(c2.has_error());
+    BOOST_CHECK(c2.error() == llfio::errc::operation_not_permitted);
+  }
+  // The temporary file really was relinked onto the destination: the new contents are there and no
+  // temporary is left behind.
+  BOOST_CHECK(read_file(dirh, "fallback_allowed.txt") == "replacement");
+  BOOST_CHECK_EQUAL(count_random_files(dirpath), temps_before);
+  // The same holds when the destination does not exist yet.
+  {
+    atomic_file f = atomic_file::open(dirh, "fallback_allowed_new.txt", atomic_file::options(true)).value();
+    BOOST_CHECK(!f.is_fallback());
+    auto w = f.write(buf("fresh"));
+    BOOST_REQUIRE(!w.has_error());
+    BOOST_CHECK(w.value() == 5);
+    // Nothing is published until commit(), so the new destination must not exist yet.
+    BOOST_CHECK(!llfio::file_handle::file(dirh, "fallback_allowed_new.txt"));
+    BOOST_CHECK(!f.replacement_performed());
+    BOOST_CHECK(f.commit());
+    BOOST_CHECK(f.replacement_performed());
+  }
+  BOOST_CHECK(read_file(dirh, "fallback_allowed_new.txt") == "fresh");
+  BOOST_CHECK_EQUAL(count_random_files(dirpath), temps_before);
+  // Cancelling an opted-in but non-fallback transaction must work, because it is an ordinary
+  // transaction and cancellation is perfectly implementable for it. This is the other visible
+  // symptom of the bug: with `_fallback` wrongly true, `cancel()` returned `not_supported`.
+  {
+    atomic_file f = atomic_file::open(dirh, "fallback_allowed_cancel.txt", atomic_file::options(true)).value();
+    BOOST_CHECK(!f.is_fallback());
+    auto w = f.write(buf("doomed"));
+    BOOST_REQUIRE(!w.has_error());
+    BOOST_CHECK(w.value() == 6);
+    BOOST_CHECK(f.cancel());
+    BOOST_CHECK(f.current_state() == atomic_file::state::cancelled);
+    auto c = f.commit();
+    BOOST_REQUIRE(c.has_error());
+    BOOST_CHECK(c.error() == llfio::errc::operation_canceled);
+  }
+  // Cancellation was honoured: the destination was never created, and the temporary file is gone.
+  BOOST_CHECK(!llfio::file_handle::file(dirh, "fallback_allowed_cancel.txt"));
+  BOOST_CHECK_EQUAL(count_random_files(dirpath), temps_before);
+}
+
 // Regression test for a fallback-mode transaction damaging the caller's destination.
 //
 // `open()` can fail part way through setting up the fallback, after it has taken a handle to the
@@ -1030,6 +1112,7 @@ static inline void TestAtomicFile()
     TestDirectoryBarrierFails(dirh);
     TestReaderNeverSeesPartial(dirh);
     TestFallback(dirh);
+    TestFallbackPermittedButUnused(dirh);
     TestFallbackSetupFailure(dirh);
     TestFallbackErrorClass(dirh);
     TestMove(dirh);

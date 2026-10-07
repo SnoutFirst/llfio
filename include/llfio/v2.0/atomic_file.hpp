@@ -212,6 +212,12 @@ public:
     could not be created is reported to the caller unchanged, because falling back would either
     fail anyway or destroy the destination on the way to failing. See
     \ref atomic_file_fallback for the exact list and the reasoning.
+
+    Note carefully that this option means "falling back is **permitted**", never "this transaction
+    **is** in fallback mode". Setting it does not by itself change anything: an opted-in transaction
+    which *can* create its temporary file is a completely ordinary atomic one - writes go to the
+    temporary file, `commit()` relinks it, `is_fallback()` returns false. Whether the fallback was
+    actually taken is transaction state, reported by `is_fallback()`.
     */
     bool fallback;
     /*! The caching to use for the file. Defaults to `caching::all`, i.e. normal cached writes
@@ -366,6 +372,11 @@ public:
   //! The current state of the transaction.
   state current_state() const noexcept { return _state; }
   //! Whether this transaction is writing the destination directly (see `options::fallback`).
+  /*! This is the transaction *state*, and is deliberately not the same as `options::fallback`, which
+  only says that falling back would have been permitted. It is false for every transaction which
+  managed to create its temporary file, including every transaction opened with `options(true)` in a
+  directory which allows new names; only a transaction which actually took the fallback reports true.
+  */
   bool is_fallback() const noexcept { return _fallback; }
   /*! Whether this transaction has modified the destination path.
 
