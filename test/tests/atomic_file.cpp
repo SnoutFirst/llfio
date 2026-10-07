@@ -25,19 +25,23 @@ Distributed under the Boost Software License, Version 1.0.
 #include "../test_kernel_decl.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 #ifndef _WIN32
-// For `mode_t` and the process umask, used by the permission preservation test.
+// For `mode_t` and the process umask, used by the permission preservation test, and for the FIFO
+// and directory permissions used by the fallback setup failure test.
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
 
 #ifdef __linux__
-// For the private mount namespace in which the fallback setup failure test runs.
+// For the fsync() interposition which injects commit() barrier failures, and for the private
+// mount namespaces in which the fallback failure tests run.
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -45,8 +49,60 @@ Distributed under the Boost Software License, Version 1.0.
 #include <sched.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
+
+#ifdef __linux__
+// ---------------------------------------------------------------------------------------------
+// Fault injection for the two barrier steps of commit().
+//
+// LLFIO has no fault injection mechanism of its own, so this test supplies one at the system call
+// boundary, which needs no change to the library and does not weaken it in any way. Defining
+// fsync() in the test executable interposes it for the whole program: the linker resolves the
+// references LLFIO emits - whether LLFIO was linked statically, header only or as a shared library
+// - to the definition below, because the executable comes first in the symbol lookup scope and no
+// `-Bsymbolic` was used. Both barrier steps of commit() reach the system through fsync():
+// `byte_io_handle::barrier(barrier_kind::wait_all)` calls fsync() on the temporary file, and
+// `directory_handle::barrier()` calls fsync() on the containing directory.
+//
+// The override is completely transparent until armed, and once armed it fails only one *kind* of
+// descriptor, told apart with fstat(), so that the temporary file's barrier and the directory's
+// barrier can be failed independently of one another. The real work is done with the fsync system
+// call directly, so that this definition cannot recurse into itself.
+enum class fail_fsync
+{
+  none,       //!< Transparent: pass everything through to the real fsync.
+  regular,    //!< Fail only barriers of regular files, i.e. step (ii) of commit().
+  directory   //!< Fail only barriers of directories, i.e. step (iv) of commit().
+};
+
+static fail_fsync g_fail_fsync = fail_fsync::none;
+static int g_fail_fsync_errno = EIO;
+static unsigned g_fail_fsync_injected = 0;
+
+extern "C" int fsync(int fd)
+{
+  if(g_fail_fsync != fail_fsync::none)
+  {
+    struct stat s
+    {
+    };
+    if(::fstat(fd, &s) == 0)
+    {
+      const bool is_directory = S_ISDIR(s.st_mode) != 0;
+      const bool fail_this_one = (g_fail_fsync == fail_fsync::regular) ? !is_directory : is_directory;
+      if(fail_this_one)
+      {
+        g_fail_fsync_injected++;
+        errno = g_fail_fsync_errno;
+        return -1;
+      }
+    }
+  }
+  return static_cast<int>(::syscall(SYS_fsync, fd));
+}
 #endif
 
 namespace llfio = LLFIO_V2_NAMESPACE;
@@ -334,7 +390,9 @@ static void TestOpenIntoNonexistentDirectory(const llfio::directory_handle &dirh
   BOOST_REQUIRE(f.has_error());
 }
 
-// Replacing a path which is actually a directory must fail at commit, and leave the directory alone.
+// Replacing a path which is actually a directory must fail at commit, and leave the directory
+// alone. This is the natural way to make the atomic replacement itself fail: renaming a file over
+// a directory is refused by the filing system.
 static void TestDestinationIsDirectory(const llfio::directory_handle &dirh)
 {
   std::error_code ec;
@@ -343,14 +401,115 @@ static void TestDestinationIsDirectory(const llfio::directory_handle &dirh)
   {
     atomic_file f = atomic_file::open(dirh, "adir").value();
     BOOST_CHECK(f.write(buf("not allowed")).value() == 11);
+    // Step (ii), the temporary file's barrier, must have succeeded, so what fails below is the
+    // replacement itself and not something earlier.
     auto c = f.commit();
     BOOST_REQUIRE(c.has_error());
+    // The destination has not been replaced, the transaction is failed rather than committed, and
+    // it is still the atomic transaction it was - a commit failure must never quietly turn into a
+    // non-atomic write of the destination.
     BOOST_CHECK(!f.replacement_performed());
+    BOOST_CHECK(f.current_state() == atomic_file::state::failed);
+    BOOST_CHECK(!f.is_fallback());
+    // A second commit() must not try the replacement again: the transaction is failed, so it is
+    // reported as such rather than re-attempting anything.
+    auto c2 = f.commit();
+    BOOST_REQUIRE(c2.has_error());
+    BOOST_CHECK(c2.error() == llfio::errc::operation_canceled);
   }
+  // The destination directory is untouched, and the temporary file has been cleaned up.
   BOOST_CHECK(llfio::filesystem::is_directory(dirh.current_path().value() / "adir", ec));
-  // And the temp file must have been cleaned up
   BOOST_CHECK(count_random_files(dirh.current_path().value()) == 0);
 }
+
+#ifdef __linux__
+// Step (ii) of commit(), the durability barrier of the temporary file, must fail the transaction
+// without touching the destination, and the temporary file must be cleaned up.
+static void TestCommitBarrierFails(const llfio::directory_handle &dirh)
+{
+  const llfio::filesystem::path dirpath = dirh.current_path().value();
+  {
+    std::ofstream(dirpath / "barrier.txt") << "original";
+  }
+  BOOST_REQUIRE(llfio::filesystem::exists(dirpath / "barrier.txt"));
+  {
+    atomic_file f = atomic_file::open(dirh, "barrier.txt").value();
+    BOOST_CHECK(f.write(buf("replacement")).value() == 11);
+    g_fail_fsync_injected = 0;
+    g_fail_fsync = fail_fsync::regular;
+    auto c = f.commit();
+    g_fail_fsync = fail_fsync::none;
+    BOOST_REQUIRE(c.has_error());
+    BOOST_CHECK(c.error() == llfio::errc::io_error);
+    // Exactly the temporary file's barrier was failed - not the directory's, and not something
+    // else entirely.
+    BOOST_CHECK_EQUAL(g_fail_fsync_injected, 1);
+    // The destination has not been replaced, and the transaction is failed rather than committed.
+    BOOST_CHECK(f.current_state() == atomic_file::state::failed);
+    BOOST_CHECK(!f.replacement_performed());
+    BOOST_CHECK(!f.is_fallback());
+    auto c2 = f.commit();
+    BOOST_REQUIRE(c2.has_error());
+    BOOST_CHECK(c2.error() == llfio::errc::operation_canceled);
+  }
+  // The destination still holds its original contents, and the temporary file has been discarded.
+  BOOST_CHECK(read_file(dirh, "barrier.txt") == "original");
+  BOOST_CHECK(count_random_files(dirpath) == 0);
+}
+
+// Step (iv) of commit(), the flush of the containing directory, is the one step which can fail
+// *after* the destination has already been replaced. The replacement cannot be undone, so what
+// matters is that the object reports the failure without pretending the destination is untouched,
+// that it reports the error, and that it neither undoes nor unlinks what it has published, nor
+// attempts the replacement a second time.
+static void TestDirectoryBarrierFails(const llfio::directory_handle &dirh)
+{
+  const llfio::filesystem::path dirpath = dirh.current_path().value();
+  {
+    std::ofstream(dirpath / "dirbarrier.txt") << "original";
+  }
+  BOOST_REQUIRE(llfio::filesystem::exists(dirpath / "dirbarrier.txt"));
+  {
+    atomic_file f = atomic_file::open(dirh, "dirbarrier.txt").value();
+    BOOST_CHECK(f.write(buf("replacement")).value() == 11);
+    BOOST_CHECK(!f.replacement_performed());
+    g_fail_fsync_injected = 0;
+    g_fail_fsync = fail_fsync::directory;
+    auto c = f.commit();
+    g_fail_fsync = fail_fsync::none;
+    // The directory's barrier failed, and it was the only injected failure, so the temporary
+    // file's own barrier and the replacement itself really did succeed.
+    BOOST_REQUIRE(c.has_error());
+    BOOST_CHECK(c.error() == llfio::errc::io_error);
+    BOOST_CHECK_EQUAL(g_fail_fsync_injected, 1);
+    // The rename is a single atomic operation and happened before the directory flush, so the
+    // destination *has* been replaced even though commit() failed. replacement_performed() must
+    // say so, so that the caller can tell this apart from a failure which did not publish.
+    BOOST_CHECK(f.replacement_performed());
+    BOOST_CHECK(f.current_state() == atomic_file::state::committed);
+    BOOST_CHECK(!f.is_fallback());
+    BOOST_CHECK(read_file(dirh, "dirbarrier.txt") == "replacement");
+    // A subsequent commit() must not attempt the replacement again. It reports the transaction as
+    // already committed, rather than re-renaming anything.
+    auto c2 = f.commit();
+    BOOST_REQUIRE(c2.has_error());
+    BOOST_CHECK(c2.error() == llfio::errc::operation_not_permitted);
+    BOOST_CHECK_EQUAL(g_fail_fsync_injected, 1);
+  }
+  // Destroying the transaction must not undo or unlink the destination it has just published.
+  BOOST_CHECK(read_file(dirh, "dirbarrier.txt") == "replacement");
+  BOOST_CHECK(count_random_files(dirpath) == 0);
+}
+#else
+static void TestCommitBarrierFails(const llfio::directory_handle &)
+{
+  BOOST_TEST_MESSAGE("Commit barrier failure test needs to interpose fsync(), which is Linux only. So skipping this test.");
+}
+static void TestDirectoryBarrierFails(const llfio::directory_handle &)
+{
+  BOOST_TEST_MESSAGE("Directory barrier failure test needs to interpose fsync(), which is Linux only. So skipping this test.");
+}
+#endif
 
 // A concurrent reader must never observe a partially written destination.
 static void TestReaderNeverSeesPartial(const llfio::directory_handle &dirh)
@@ -397,12 +556,39 @@ static void TestReaderNeverSeesPartial(const llfio::directory_handle &dirh)
       reads.fetch_add(1, std::memory_order_relaxed);
     }
   });
+  // Stop and join the reader before any `BOOST_REQUIRE` is allowed to return from this function:
+  // an early return would leave `reader` joinable, and its destructor would call `std::terminate`,
+  // masking the real failure with a crash.
+  auto stop_and_join = [&]
+  {
+    stop.store(true, std::memory_order_release);
+    reader.join();
+  };
   for(unsigned gen = 1; gen <= 200 && !torn.load(std::memory_order_relaxed); gen++)
   {
-    atomic_file f = atomic_file::open(dirh, "concurrent.txt").value();
+    auto opened = atomic_file::open(dirh, "concurrent.txt");
+    if(!opened)
+    {
+      stop_and_join();
+      BOOST_REQUIRE(opened);
+      return;
+    }
+    atomic_file f = std::move(opened).value();
     std::string s(len, static_cast<char>('A' + (gen % 26)));
-    BOOST_REQUIRE(f.write(buf(s)));
-    BOOST_REQUIRE(f.commit());
+    auto written = f.write(buf(s));
+    if(!written)
+    {
+      stop_and_join();
+      BOOST_REQUIRE(written);
+      return;
+    }
+    auto committed = f.commit();
+    if(!committed)
+    {
+      stop_and_join();
+      BOOST_REQUIRE(committed);
+      return;
+    }
   }
   stop.store(true, std::memory_order_release);
   reader.join();
@@ -440,6 +626,10 @@ static void TestFallback(const llfio::directory_handle &dirh)
     // Without fallback, this must fail because the temporary file cannot be created.
     auto f = atomic_file::open(rodirh, "target.txt");
     BOOST_REQUIRE(f.has_error());
+    // The class of failure this test relies on is exactly the one the fallback exists for: the
+    // directory refuses to let this process add a new name to it. Pinning the error here keeps the
+    // fallback's trigger honest - if error classification changed, this would stop matching.
+    BOOST_CHECK(f.error() == llfio::errc::permission_denied);
     // With fallback, it must succeed, and report that it is in fallback mode.
     atomic_file g = atomic_file::open(rodirh, "target.txt", atomic_file::options(true)).value();
     BOOST_CHECK(g.is_fallback());
@@ -465,33 +655,88 @@ static void TestFallback(const llfio::directory_handle &dirh)
                                  ec);
 }
 
-// Regression test for a fallback-mode transaction deleting the caller's destination.
+// Regression test for a fallback-mode transaction damaging the caller's destination.
 //
-// The scenario is narrow and needs the right conditions to be observable at all: `open()` must fail
-// part way through fallback setup, after it has taken a handle to the real destination but before
-// it has recorded that the destination was modified. The partially constructed transaction is then
-// destroyed, and its destructor must not unlink the destination.
+// `open()` can fail part way through setting up the fallback, after it has taken a handle to the
+// real destination but before it has recorded that the destination was modified. The partially
+// constructed transaction is then destroyed, and its destructor must not unlink the destination.
 //
-// Choosing those conditions takes care, because the obvious arrangements hide the bug rather than
-// expose it. Fallback is reached by making the temporary file uncreatable, so start by making the
-// directory unwritable: the destructive unlink then fails with EACCES on that same directory, and
-// the test passes whether or not the bug is present. Instead point the destination at a symlink to
-// the null device - opening it for writing succeeds, `ftruncate` fails - but that hides the bug too,
-// because the entry and the handle then disagree and LLFIO's safety unlink refuses to remove it.
+// The reachable way to get there needs a destination which opens for writing but cannot be
+// truncated, so use a FIFO with its read end held open: opening it for writing succeeds,
+// `ftruncate()` fails, and `open()` then reports that failure and destroys the transaction. A
+// symlink to the null device would also fail to truncate, but it hides any wrongful unlink,
+// because LLFIO's safety unlink refuses to remove an entry which does not match the handle.
 //
-// So the destination has to be an entry which opens for writing, cannot be truncated, and *is* the
-// object the handle refers to. A FIFO is all three, provided its read end is held open. And fallback
-// is triggered without touching permissions by exhausting the filesystem's inodes: creating a new
-// file then fails, while deleting an existing one still succeeds, so a destructor which unlinks the
-// destination really does delete it. Exhausting inodes needs a filesystem we control, so this runs
-// in a child process inside a private mount namespace with its own tiny tmpfs, destroyed along with
-// the child. That needs root or unprivileged user namespaces; otherwise the test skips rather than
-// reporting a result it did not obtain.
+// This test used to run in a *writable* directory, reaching the fallback by exhausting the
+// filesystem's inodes, which is what let a wrongful unlink actually succeed and so be observable.
+// Now that the fallback trigger is narrowed to `errc::permission_denied` (see atomic_file.hpp) the
+// only way into fallback setup is a directory which refuses new names - and such a directory
+// refuses unlinks too, so a wrongful unlink there cannot be observed even if it existed. The
+// scenario is kept because the invariant is still worth guarding, but on its own it no longer
+// proves the destructor is safe: what does is the `_destination`/`_tempfile` split in
+// atomic_file.hpp. Observing it again would need the fallback trigger set to be widened first.
+static void TestFallbackSetupFailure(const llfio::directory_handle &dirh)
+{
+#ifndef _WIN32
+  if(::geteuid() == 0)
+  {
+    // Folder permissions do not apply to root, so the fallback could not be triggered this way.
+    BOOST_TEST_MESSAGE("Fallback setup failure test cannot run as root. So skipping this test.");
+    return;
+  }
+  const llfio::filesystem::path dirpath = dirh.current_path().value();
+  const llfio::filesystem::path fdir = dirpath / "fallback_setup";
+  std::error_code ec;
+  llfio::filesystem::create_directory(fdir, ec);
+  BOOST_REQUIRE(!ec);
+  const std::string target = (fdir / "target.txt").string();
+  BOOST_REQUIRE(::mkfifo(target.c_str(), 0644) == 0);
+  // Hold the read end open: that is what stops opening the FIFO for writing from blocking.
+  const int fifo_reader = ::open(target.c_str(), O_RDONLY | O_NONBLOCK);
+  BOOST_REQUIRE(fifo_reader >= 0);
+  {
+    // A directory which refuses to let this process add a new name to it. That is the only failure
+    // which reaches the fallback, and it is what makes the temporary file uncreatable here.
+    BOOST_REQUIRE(::chmod(fdir.string().c_str(), 0500) == 0);
+    auto fdirh = llfio::directory_handle::directory(dirh, "fallback_setup", llfio::file_handle::mode::read);
+    BOOST_REQUIRE(fdirh);
+    auto f = atomic_file::open(fdirh.value(), "target.txt", atomic_file::options(true));
+    BOOST_REQUIRE(f.has_error());
+    // The destination is a FIFO, so it opens for writing but cannot be truncated: the failure must
+    // be that truncation, not some earlier step of the fallback setup.
+    BOOST_CHECK(f.error() == llfio::errc::invalid_argument);
+    // `open()` destroys the partially constructed transaction before returning to us.
+  }
+  ::close(fifo_reader);
+  struct stat st
+  {
+  };
+  BOOST_REQUIRE(::lstat(target.c_str(), &st) == 0);
+  BOOST_CHECK(S_ISFIFO(st.st_mode));
+  // Let the test directory be cleaned up again.
+  BOOST_REQUIRE(::chmod(fdir.string().c_str(), 0700) == 0);
+#else
+  (void) dirh;
+  BOOST_TEST_MESSAGE("Fallback setup failure test needs POSIX FIFOs. So skipping this test.");
+#endif
+}
+
+// The fallback must activate for exactly one class of failure to create the temporary file, and
+// must not activate for any other - even when direct writing *would* have worked. This is the
+// case which makes that distinction observable: a filing system with no free inodes left refuses
+// to create the temporary file with `ENOSPC`, while the destination's own existing inode can
+// still be opened for writing. The broad "fall back for any reason" behaviour would therefore
+// silently truncate the destination here; the documented behaviour reports the `ENOSPC` and
+// leaves the destination intact.
+//
+// Like all such tests here it needs a filesystem whose inodes we control, so it runs in a child
+// process inside a private mount namespace, and skips when neither root nor usable unprivileged
+// user namespaces are available.
 #ifndef __linux__
-static void TestFallbackSetupFailure(const llfio::directory_handle &)
+static void TestFallbackErrorClass(const llfio::directory_handle &)
 {
   BOOST_TEST_MESSAGE(
-  "Fallback setup failure test needs tmpfs and mount namespaces, which are Linux only. So skipping this test.");
+  "Fallback error class test needs tmpfs and mount namespaces, which are Linux only. So skipping this test.");
 }
 #else
 // Write a small string to a pseudo-file, used to configure user namespace id maps.
@@ -508,133 +753,43 @@ static bool write_pseudofile(const char *path, const char *contents)
   return ok;
 }
 
-// Runs in the child process. Returns 0 if the destination survived, 77 if the environment cannot
-// host the test, and any other value to identify which step failed. Deliberately uses no assertion
-// macro: the parent asserts on the exit code.
-static int fallback_setup_failure_child(int userns_ready_fd, int userns_go_fd, const char *mountpoint)
+// Joins a private mount namespace, which is what lets a test mount its own tiny tmpfs without
+// affecting anything else. This needs either root or usable unprivileged user namespaces, so the
+// child reports 77 when it cannot get one. Runs in the child process; never returns.
+static void enter_private_mount_namespace(int userns_ready_fd, int userns_go_fd)
 {
   if(::geteuid() != 0)
   {
     // Become root inside a new user namespace, which is enough to mount tmpfs.
     if(::unshare(CLONE_NEWUSER) != 0)
     {
-      return 77;
+      ::_exit(77);
     }
     // The id maps have to be written by some *other* process: having just called unshare(CLONE_NEWUSER)
     // we no longer hold the capability to write our own. Hand over to the parent and wait for it.
     if(::write(userns_ready_fd, "1", 1) != 1)
     {
-      return 77;
+      ::_exit(77);
     }
     char go = 0;
     if(::read(userns_go_fd, &go, 1) != 1)
     {
-      return 77;
+      ::_exit(77);
     }
   }
   if(::unshare(CLONE_NEWNS) != 0)
   {
-    return 77;
+    ::_exit(77);
   }
   // Stop the mount below propagating back into the parent's namespace.
   (void) ::mount("none", "/", nullptr, MS_REC | MS_PRIVATE, nullptr);
-  if(::mount("tmpfs", mountpoint, "tmpfs", 0, "size=4M,nr_inodes=8") != 0)
-  {
-    return 77;
-  }
-  const std::string sub = std::string(mountpoint) + "/sub";
-  if(::mkdir(sub.c_str(), 0755) != 0)
-  {
-    return 1;
-  }
-  const std::string target = sub + "/target.txt";
-  if(::mkfifo(target.c_str(), 0644) != 0)
-  {
-    return 1;
-  }
-  // Hold the read end open: that is what stops opening the FIFO for writing from blocking.
-  const int fifo_reader = ::open(target.c_str(), O_RDONLY | O_NONBLOCK);
-  if(fifo_reader < 0)
-  {
-    return 1;
-  }
-  // Use up every remaining inode, so that creating a new file must now fail.
-  int fillers = 0;
-  for(; fillers < 64; fillers++)
-  {
-    const std::string filler = sub + "/filler" + std::to_string(fillers);
-    const int fd = ::open(filler.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if(fd < 0)
-    {
-      break;
-    }
-    ::close(fd);
-  }
-  if(fillers == 0 || fillers == 64)
-  {
-    return 77;  // inodes not exhausted, or not exhausted within a sane number of files
-  }
-  // The precondition which makes the bug observable: deleting must still be possible. If it is not,
-  // a destructor unlinking the destination would fail harmlessly and this test would prove nothing.
-  if(::unlink((sub + "/filler0").c_str()) != 0)
-  {
-    return 77;
-  }
-  const int refill = ::open((sub + "/filler0").c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-  if(refill < 0)
-  {
-    return 77;
-  }
-  ::close(refill);
-  {
-    const int probe = ::open((sub + "/probe").c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-    if(probe >= 0)
-    {
-      ::close(probe);
-      (void) ::unlink((sub + "/probe").c_str());
-      return 77;  // creating a file still works, so fallback would not be reached
-    }
-  }
-  {
-    auto dirh = llfio::directory_handle::directory({}, sub);
-    if(!dirh)
-    {
-      return 2;
-    }
-    {
-      auto f = atomic_file::open(dirh.value(), "target.txt", atomic_file::options(true));
-      if(!f.has_error())
-      {
-        return 3;  // the destination cannot be truncated, so this must fail
-      }
-      if(f.error() != llfio::errc::invalid_argument)
-      {
-        return 4;  // and it must be the truncation failing, not some earlier step
-      }
-      // `open()` destroys the partially constructed transaction before returning to us.
-    }
-    ::close(fifo_reader);
-    struct stat st{};
-    if(::lstat(target.c_str(), &st) != 0)
-    {
-      return 5;  // the destination is gone, which is the bug
-    }
-    if(!S_ISFIFO(st.st_mode))
-    {
-      return 6;
-    }
-  }
-  return 0;
 }
 
-static void TestFallbackSetupFailure(const llfio::directory_handle &dirh)
+// Runs `child` in a forked process which is given a private mount namespace and a mountpoint to
+// mount a tmpfs on. Returns the child's exit code, or -1 when the environment cannot host such a
+// test at all, in which case the caller must skip rather than report a result it did not obtain.
+static int run_in_private_mount_namespace(int (*child)(int, int, const char *), const std::string &mountpoint)
 {
-  const llfio::filesystem::path mountpoint = dirh.current_path().value() / "fallback_ns";
-  std::error_code ec;
-  llfio::filesystem::create_directory(mountpoint, ec);
-  BOOST_REQUIRE(!ec);
-  const std::string mountpoint_str = mountpoint.string();
-  const bool need_userns = ::geteuid() != 0;
   // Writing to a pipe whose reader has already gone would raise SIGPIPE, which must not abort the run.
   (void) ::signal(SIGPIPE, SIG_IGN);
   int userns_ready[2] = {-1, -1};
@@ -647,10 +802,11 @@ static void TestFallbackSetupFailure(const llfio::directory_handle &dirh)
   {
     ::close(userns_ready[0]);
     ::close(userns_go[1]);
-    ::_exit(fallback_setup_failure_child(userns_ready[1], userns_go[0], mountpoint_str.c_str()));
+    ::_exit(child(userns_ready[1], userns_go[0], mountpoint.c_str()));
   }
   ::close(userns_ready[1]);
   ::close(userns_go[0]);
+  const bool need_userns = ::geteuid() != 0;
   bool maps_written = false;
   if(need_userns)
   {
@@ -682,16 +838,138 @@ static void TestFallbackSetupFailure(const llfio::directory_handle &dirh)
   const int code = WEXITSTATUS(status);
   if(code == 77 || (need_userns && !maps_written))
   {
+    return -1;
+  }
+  return code;
+}
+
+static int fallback_error_class_child(int userns_ready_fd, int userns_go_fd, const char *mountpoint)
+{
+  enter_private_mount_namespace(userns_ready_fd, userns_go_fd);
+  // Enough inodes for the directory, the destination and a handful of fillers, and nothing more.
+  if(::mount("tmpfs", mountpoint, "tmpfs", 0, "size=4M,nr_inodes=8") != 0)
+  {
+    return 77;
+  }
+  const std::string sub = std::string(mountpoint) + "/sub";
+  if(::mkdir(sub.c_str(), 0755) != 0)
+  {
+    return 1;
+  }
+  const std::string target = sub + "/target.txt";
+  {
+    const int fd = ::open(target.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if(fd < 0)
+    {
+      return 1;
+    }
+    const bool written = ::write(fd, "original", 8) == 8;
+    ::close(fd);
+    if(!written)
+    {
+      return 1;
+    }
+  }
+  // Use up every remaining inode, so that creating a new file must now fail.
+  int fillers = 0;
+  for(; fillers < 64; fillers++)
+  {
+    const std::string filler = sub + "/filler" + std::to_string(fillers);
+    const int fd = ::open(filler.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if(fd < 0)
+    {
+      break;
+    }
+    ::close(fd);
+  }
+  if(fillers == 0 || fillers == 64)
+  {
+    return 77;  // inodes not exhausted, or not exhausted within a sane number of files
+  }
+  {
+    // Precondition: creating a *new* name must now fail, and it must fail for the reason this test
+    // is about. Any other error would mean the test was measuring something else.
+    const int probe = ::open((sub + "/probe").c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
+    if(probe >= 0)
+    {
+      ::close(probe);
+      (void) ::unlink((sub + "/probe").c_str());
+      return 77;  // creating a file still works, so no failure to classify
+    }
+    if(errno != ENOSPC)
+    {
+      return 77;  // out of inodes for some reason other than ENOSPC
+    }
+  }
+  {
+    auto dirh = llfio::directory_handle::directory({}, sub);
+    if(!dirh)
+    {
+      return 2;
+    }
+    {
+      // Precondition: direct writing to the destination would have worked, since no new inode is
+      // needed to open an existing file. Without this, not falling back would be indistinguishable
+      // from falling back and failing, and the test would prove nothing.
+      auto direct = llfio::file_handle::file(dirh.value(), "target.txt", llfio::file_handle::mode::write);
+      if(!direct)
+      {
+        return 7;
+      }
+      if(!direct.value().close())
+      {
+        return 7;
+      }
+    }
+    // The temporary file cannot be created, and the reason is resource exhaustion rather than a
+    // refusal of new names by the directory. So even with fallback explicitly enabled this must be
+    // an error, and it must be the temporary file's own `ENOSPC` rather than the fallback's.
+    auto f = atomic_file::open(dirh.value(), "target.txt", atomic_file::options(true));
+    if(!f.has_error())
+    {
+      return 3;  // fell back, which is exactly what must not happen
+    }
+    if(f.error() != llfio::errc::no_space_on_device)
+    {
+      return 4;  // and it must be the failure to create the temporary file which is reported
+    }
+  }
+  {
+    // The destination must still hold its original contents. A fallback would have truncated it
+    // while opening, before any of this could be observed.
+    const int fd = ::open(target.c_str(), O_RDONLY);
+    if(fd < 0)
+    {
+      return 5;
+    }
+    char contents[16] = {0};
+    const ssize_t got = ::read(fd, contents, sizeof(contents) - 1);
+    ::close(fd);
+    if(got != 8 || ::strncmp(contents, "original", 8) != 0)
+    {
+      return 6;  // the destination was destroyed or changed
+    }
+  }
+  return 0;
+}
+
+static void TestFallbackErrorClass(const llfio::directory_handle &dirh)
+{
+  const llfio::filesystem::path mountpoint = dirh.current_path().value() / "fallback_errclass";
+  std::error_code ec;
+  llfio::filesystem::create_directory(mountpoint, ec);
+  BOOST_REQUIRE(!ec);
+  const int code = run_in_private_mount_namespace(fallback_error_class_child, mountpoint.string());
+  if(code < 0)
+  {
     BOOST_TEST_MESSAGE(
-    "Fallback setup failure test needs root or usable unprivileged user namespaces. So skipping this test.");
+    "Fallback error class test needs root or usable unprivileged user namespaces. So skipping this test.");
     return;
   }
   if(code != 0)
   {
-    // Note: BOOST_CHECK_MESSAGE() in this framework only logs, it does not register a failure, so the
-    // diagnosis goes out as a message and the actual pass/fail goes through BOOST_CHECK().
-    BOOST_TEST_MESSAGE("fallback setup failure test: child process exited " << code
-                                                                            << " (5 means it deleted the destination)");
+    BOOST_TEST_MESSAGE("fallback error class test: child process exited "
+                       << code << " (3 means it fell back, 6 means it destroyed the destination)");
   }
   BOOST_CHECK(code == 0);
 }
@@ -723,7 +1001,11 @@ static void TestMove(const llfio::directory_handle &dirh)
 
 static inline void TestAtomicFile()
 {
-  const llfio::filesystem::path dirpath = llfio::filesystem::temp_directory_path() / "llfio_atomic_file_test";
+  // The scratch directory must be unique to this process. This same test binary exists in several
+  // configurations (exceptions/status_code, sl/hl/dl, asan/tsan) and ctest may run them at the
+  // same time; with a fixed name two instances would delete each other's files and the test would
+  // fail non-deterministically, which is worse than not testing at all.
+  const llfio::filesystem::path dirpath = llfio::filesystem::temp_directory_path() / ("llfio_atomic_file_test-" + llfio::utils::random_string(16));
   std::error_code ec;
   llfio::filesystem::remove_all(dirpath, ec);
   BOOST_REQUIRE(llfio::filesystem::create_directory(dirpath, ec));
@@ -744,9 +1026,12 @@ static inline void TestAtomicFile()
     TestPathWithDirectory(dirh);
     TestOpenIntoNonexistentDirectory(dirh);
     TestDestinationIsDirectory(dirh);
+    TestCommitBarrierFails(dirh);
+    TestDirectoryBarrierFails(dirh);
     TestReaderNeverSeesPartial(dirh);
     TestFallback(dirh);
     TestFallbackSetupFailure(dirh);
+    TestFallbackErrorClass(dirh);
     TestMove(dirh);
   }
   llfio::filesystem::remove_all(dirpath, ec);

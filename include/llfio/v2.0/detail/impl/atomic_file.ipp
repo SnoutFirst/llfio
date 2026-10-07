@@ -65,9 +65,18 @@ LLFIO_HEADERS_ONLY_MEMFUNC_SPEC result<atomic_file> atomic_file::open(const path
       ret._tempfile = std::move(temp).value();
       return ret;
     }
-    if(!opts.fallback)
+    auto failed = std::move(temp).error();
+    /* Only one class of failure to create the temporary file means "this directory will not let us
+    add a new name, but the destination's own inode may still be writable": `EACCES`. Falling back
+    for anything else would be misleading at best, and at worst destructive - the fallback truncates
+    the destination as it starts, so a resource-exhaustion failure would destroy the old contents on
+    its way to failing with the very same error. Everything else is therefore reported unchanged, as
+    it would be with the fallback switched off. This is the same line `QSaveFile` draws: its POSIX
+    fallback is guarded by `errno == EACCES`. See the fallback documentation in the class comment.
+    */
+    if(!opts.fallback || failed != errc::permission_denied)
     {
-      return std::move(temp).error();
+      return failed;
     }
     // The caller has opted in to the non-atomic fallback: write the destination in place. Note that
     // the real destination is stored in `_destination`, never in `_tempfile`, so if any of the steps

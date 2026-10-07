@@ -84,8 +84,8 @@ which replaces it), or lives on a filing system which does not report or apply p
 temporary file keeps the mode it was created with, subject to the process umask. This step is best
 effort and never fails the commit. Ownership, ACLs and extended attributes are **not** copied, only
 the permission bits; if you need those preserved, do so yourself.
-- **The fallback mode is not atomic.** See `options::fallback` below. When it is active, guarantee
-(1) and guarantee (2) do not hold.
+- **The fallback mode is not atomic.** See `options::fallback` and \ref atomic_file_fallback
+below. When it is active, guarantee (1) and guarantee (2) do not hold.
 - **Storage stacks which lie about flushes** (some cheap USB sticks, some virtualised block layers)
 will break guarantee (3) no matter what this class does.
 - On Windows, directory metadata durability relies upon the OS and filesystem accepting a flush of
@@ -108,6 +108,63 @@ If step (iv) fails, the destination *has* already been replaced with the new con
 unavoidable: the rename is a single atomic operation and there is no way to undo it), but the
 durability of that replacement is not confirmed. In that case `commit()` returns the failure from
 step (iv), and `replacement_performed()` returns true so you can tell the two situations apart.
+
+\section atomic_file_fallback Which failures activate the non-atomic fallback
+
+`options::fallback` defaults to `false`, so by default a temporary file which cannot be created is
+simply an error. When it is explicitly enabled, exactly **one** class of failure to create that
+temporary file diverts the transaction into writing the destination in place:
+
+- **`errc::permission_denied` (`EACCES`) - this one falls back.** It means the containing directory
+  itself refuses to let this process add a new name to it. That says nothing about the destination's
+  *own inode*, which is a separate permission and frequently may be written - it is precisely the
+  "save a document which lives in a directory I am not allowed to write" case that the fallback
+  exists for. It is also the only case `QSaveFile` falls back for: its POSIX fallback is guarded by
+  `errno == EACCES` (`qsavefile.cpp`). Note that `QSaveFile` also requires the destination to exist
+  and to be user-writable before it even attempts the temporary file, so its `EACCES` arm is only
+  ever reached in that same situation.
+
+**Every other failure to create the temporary file is returned to the caller unchanged, and no
+fallback happens.** In particular:
+
+- `errc::no_space_on_device`, `errc::file_too_large` (`ENOSPC`, `EDQUOT`, `EFBIG`, and whatever
+  else a full or quota-exhausted filing system reports): resource exhaustion. Falling back here
+  would be worse than useless: the fallback truncates the destination as it starts, so a save which
+  would have failed cleanly, leaving the old contents intact, would instead destroy those contents
+  on its way to failing with the same error. Direct writing is also unlikely to succeed for the
+  same reason the temporary file could not be allocated.
+- `errc::too_many_files_open`, `errc::too_many_files_open_in_system`, `errc::not_enough_memory`
+  (`EMFILE`, `ENFILE`, `ENOMEM`): the same kind of exhaustion. The direct open needs a descriptor
+  and memory too, so the fallback would simply fail one step later, having already thrown the
+  destination away.
+- `errc::read_only_file_system` (`EROFS`): the destination's inode is not writable either, so the
+  fallback cannot help; reporting the original error is the more honest answer.
+- `errc::no_such_file_or_directory`, `errc::not_a_directory` (`ENOENT`, `ENOTDIR`): the directory
+  which `open()` resolved has gone or changed underneath us. Quietly writing *some* destination in
+  place is not an improvement, and appearing to succeed would hide a real third-party race.
+- `errc::operation_not_permitted` (`EPERM`): what a protected directory (`fs.protected_regular=2`,
+  sticky directories) returns when it deliberately denies the creation of a new name. Reading that
+  as "then write the existing file in place instead" would subvert the protection and turn an
+  explicit refusal into an in-place overwrite. `QSaveFile` does not fall back for it either.
+- `errc::input_output_error` and the other storage failures: a failing storage stack must not be
+  silently downgraded from "the atomic save failed" to "the old contents have been destroyed".
+
+Not covered, deliberately: `QSaveFile` *also* falls back when the destination exists and is not a
+regular file (a device, a FIFO, an alternate data stream on Windows), because it cannot rename onto
+it. `atomic_file` does not, because that is not a failure to create a temporary file at all, and
+quietly reinterpreting "replace this file" as "write into this device" would change the meaning of
+the transaction behind the caller's back. Such a transaction still fails safely at `commit()` with
+the destination untouched.
+
+Two invariants follow, and they are the reason the fallback is opt-in:
+
+1. **The fallback never happens unless `options::fallback` was set.** No heuristic decides on the
+   caller's behalf that a weaker guarantee is acceptable.
+2. **The fallback can never be entered from an ordinary `write()` or `commit()` failure.** It is
+   decided once, in `open()`, before a single byte of content has been written, and is consulted
+   nowhere else. A write or commit failure always remains a hard failure of the transaction. The
+   only way content can reach a non-atomically written destination is if `open()` itself had already
+   selected the fallback, because the temporary file could not be created for `EACCES` alone.
 */
 class LLFIO_DECL atomic_file
 {
@@ -141,13 +198,20 @@ public:
    */
   struct options
   {
-    /*! If true, and if a temporary file cannot be created in the destination's directory for any
-    reason, then fall back to opening and writing the destination file directly, in place.
+    /*! If true, and if a temporary file cannot be created in the destination's directory
+    *specifically* because that directory refuses to let this process create a new name in it
+    (`errc::permission_denied`, i.e. `EACCES`), then fall back to opening and writing the
+    destination file directly, in place.
 
     This is **not atomic**: a concurrent reader may observe a partially written destination, and if
     the `atomic_file` is destroyed without `commit()` the partially written destination remains.
     It exists to mirror the behaviour of similar abstractions elsewhere, and defaults to `false`
     precisely because it silently gives up the guarantees which make this class worth using.
+
+    Only that one class of failure diverts into the fallback. Any other reason the temporary file
+    could not be created is reported to the caller unchanged, because falling back would either
+    fail anyway or destroy the destination on the way to failing. See
+    \ref atomic_file_fallback for the exact list and the reasoning.
     */
     bool fallback;
     /*! The caching to use for the file. Defaults to `caching::all`, i.e. normal cached writes
@@ -242,7 +306,9 @@ public:
   \returns A transaction. Nothing has been written to the destination yet.
 
   \errors Any of the errors which `directory_handle::directory()`, `file_handle::uniquely_named_file()`
-  or `file_handle::file()` can return.
+  or `file_handle::file()` can return. If the temporary file cannot be created and
+  `options::fallback` is set, only `errc::permission_denied` is diverted into the non-atomic
+  fallback; every other error is returned unchanged. See \ref atomic_file_fallback.
 
   \mallocs The default synchronous `handle::barrier()` implementation uses thread local buffers, and
   may allocate.
